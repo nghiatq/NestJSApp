@@ -44,6 +44,77 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
     this.validateVisitor();
   }
 
+  // Helper method to determine the line range for SQL statements
+  private determineLineRange(node: any, currentLine: number, _sqlValue: string): { startLine: number, endLine: number, context: string } {
+    const lines = this.fileContent.split('\n');
+    let startLine = currentLine;
+    let endLine = currentLine;
+
+    // 1. Check if this is a variable declaration
+    if (node.type === 'VariableDeclaration') {
+      // For variable declarations, use the declaration line as the start
+      startLine = node.location?.startLine || currentLine;
+      endLine = node.location?.endLine || currentLine;
+    }
+    // 2. Check if this is a string literal
+    else if (node.tokenType?.name === 'StringLiteral') {
+      // For string literals, try to find the variable declaration
+      const currentLineText = lines[currentLine - 1] || '';
+
+      if (currentLineText.includes('String ') && currentLineText.includes('=')) {
+        // This is already a variable declaration line
+        startLine = currentLine;
+      } else {
+        // Look for the variable declaration in previous lines
+        for (let i = currentLine - 2; i >= 0; i--) {
+          const line = lines[i];
+          if (line.includes('String ') && line.includes('=')) {
+            startLine = i + 1; // 1-based line numbers
+            break;
+          }
+        }
+      }
+
+      endLine = node.endLine || currentLine;
+    }
+    // 3. Check if this is a StringBuilder operation
+    else if (node.type === 'MethodInvocation' && node.children?.identifier?.[0]?.image === 'append') {
+      // For StringBuilder operations, find the declaration line
+      let builderVarName = '';
+
+      // Extract the variable name from the method call
+      if (node.children?.primary?.[0]?.children?.primaryPrefix?.[0]?.children?.primary?.[0]?.children?.identifier) {
+        builderVarName = node.children.primary[0].children.primaryPrefix[0].children.primary[0].children.identifier[0].image;
+      }
+
+      // Find the declaration line
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.includes('StringBuilder ' + builderVarName) ||
+            line.includes('StringBuilder ' + builderVarName + ' ')) {
+          startLine = i + 1; // 1-based line numbers
+          break;
+        }
+      }
+
+      // If we couldn't find the declaration, use the current node's line
+      if (startLine === currentLine && node.location?.startLine) {
+        startLine = node.location.startLine;
+      }
+
+      // Use the current node's end line
+      endLine = node.location?.endLine || currentLine;
+    }
+
+    // Get the full content from start to end line
+    const context = lines.slice(
+      Math.max(0, startLine - 1), // -1 to convert to 0-based index
+      Math.min(lines.length, endLine)
+    ).join('\n');
+
+    return { startLine, endLine, context };
+  }
+
   // Visit method to find SQL in string literals
   visit(cst: any): void {
     this.findSqlInStrings(cst);
@@ -117,14 +188,7 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
     // Check if this is a string concatenation with SQL
     let sqlFound = false;
     let sqlContent = '';
-    let startLine = 0;
-    let endLine = 0;
-
-    // Find the variable declaration node to get the starting line
-    let declarationNode = this.findParentVariableDeclaration(expression);
-    if (declarationNode && declarationNode.location && declarationNode.location.startLine) {
-      startLine = declarationNode.location.startLine;
-    }
+    let currentLine = 0;
 
     // Process all string literals in the expression
     const stringLiterals = this.findAllStringLiterals(expression);
@@ -136,32 +200,30 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
         sqlFound = true;
         sqlContent += value + ' ';
 
-        // If we don't have a declaration node, use the first literal's line
-        if (startLine === 0) {
-          startLine = literal.startLine;
-        }
-
-        // Track the end line (should be the last literal's line)
-        if (literal.endLine > endLine) {
-          endLine = literal.endLine;
+        // Use the first literal's line as the current line
+        if (currentLine === 0) {
+          currentLine = literal.startLine;
         }
       }
     }
 
     // If SQL was found, add it to the results
-    if (sqlFound && startLine > 0 && endLine > 0) {
-      // Get the full content from the variable declaration to the end of the operation
-      const lines = this.fileContent.split('\n');
-      const fullContent = lines.slice(
-        Math.max(0, startLine - 1), // -1 to include the declaration line
-        Math.min(lines.length, endLine)
-      ).join('\n');
+    if (sqlFound && currentLine > 0) {
+      // Find the parent variable declaration node
+      const declarationNode = this.findParentVariableDeclaration(expression);
+
+      // Determine the line range using our helper method
+      const { startLine, endLine, context } = this.determineLineRange(
+        declarationNode || expression,
+        currentLine,
+        sqlContent.trim()
+      );
 
       this.sqlStrings.push({
         value: sqlContent.trim(),
         startLine,
         endLine,
-        context: fullContent // Use the full content from declaration to end
+        context
       });
     }
   }
@@ -194,46 +256,6 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
         node.children.argumentList[0].children &&
         node.children.argumentList[0].children.expression) {
 
-      // Find the StringBuilder variable declaration
-      let builderVarName = '';
-
-      // Extract the variable name from the method call (e.g., 'sqlBuilder' from 'sqlBuilder.append()')
-      if (node.children.primary &&
-          node.children.primary[0].children &&
-          node.children.primary[0].children.primaryPrefix &&
-          node.children.primary[0].children.primaryPrefix[0].children &&
-          node.children.primary[0].children.primaryPrefix[0].children.primary &&
-          node.children.primary[0].children.primaryPrefix[0].children.primary[0].children &&
-          node.children.primary[0].children.primaryPrefix[0].children.primary[0].children.identifier) {
-
-        builderVarName = node.children.primary[0].children.primaryPrefix[0].children.primary[0].children.identifier[0].image;
-      }
-
-      // Find all StringBuilder declarations in the file
-      const lines = this.fileContent.split('\n');
-      let declarationLine = -1;
-      let lastAppendLine = -1;
-
-      // Find the declaration line
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (line.includes('StringBuilder ' + builderVarName) ||
-            line.includes('StringBuilder ' + builderVarName + ' ')) {
-          declarationLine = i + 1; // 1-based line numbers
-          break;
-        }
-      }
-
-      // If we couldn't find the declaration, use the current node's line
-      if (declarationLine === -1 && node.location && node.location.startLine) {
-        declarationLine = node.location.startLine;
-      }
-
-      // Find the last append line (current node's line)
-      if (node.location && node.location.endLine) {
-        lastAppendLine = node.location.endLine;
-      }
-
       const expression = node.children.argumentList[0].children.expression[0];
       if (expression.children && expression.children.primary &&
           expression.children.primary[0].children &&
@@ -246,17 +268,21 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
 
         // Check if the string contains SQL
         if (this.sqlRegex.test(value)) {
-          // Get the full content from declaration to last append
-          const fullContent = lines.slice(
-            Math.max(0, declarationLine - 1), // -1 to convert to 0-based index
-            Math.min(lines.length, lastAppendLine) // Current append line
-          ).join('\n');
+          // Get the current line from the string literal
+          const currentLine = stringLiteral.startLine || (node.location?.startLine || 1);
+
+          // Determine the line range using our helper method
+          const { startLine, endLine, context } = this.determineLineRange(
+            node,
+            currentLine,
+            value
+          );
 
           this.sqlStrings.push({
             value,
-            startLine: declarationLine, // Declaration line
-            endLine: lastAppendLine,   // Current append line
-            context: fullContent       // Full content from declaration to current append
+            startLine,
+            endLine,
+            context
           });
         }
       }
@@ -325,40 +351,18 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
         return;
       }
 
-      // For individual string literals, we need to find the variable declaration
-      // to set the proper lineStart
-      let declarationLine = node.startLine;
-      const endLine = node.endLine;
-
-      // Try to find the variable declaration line
-      const currentLine = lines[node.startLine - 1] || '';
-      if (currentLine.includes('String ') && currentLine.includes('=')) {
-        // This is already a variable declaration line
-        declarationLine = node.startLine;
-      } else {
-        // Look for the variable declaration in previous lines
-        // This is a simplified approach - in a real-world scenario, we would need
-        // more sophisticated analysis to find the correct variable declaration
-        for (let i = node.startLine - 2; i >= 0; i--) {
-          const line = lines[i];
-          if (line.includes('String ') && line.includes('=')) {
-            declarationLine = i + 1; // 1-based line numbers
-            break;
-          }
-        }
-      }
-
-      // Get the full content from declaration to end
-      const fullContent = lines.slice(
-        Math.max(0, declarationLine - 1), // -1 to convert to 0-based index
-        Math.min(lines.length, endLine)   // End line
-      ).join('\n');
+      // Determine the line range using our helper method
+      const { startLine, endLine, context } = this.determineLineRange(
+        node,
+        node.startLine,
+        value
+      );
 
       this.sqlStrings.push({
         value,
-        startLine: declarationLine, // Declaration line
-        endLine,                    // End line
-        context: fullContent        // Full content from declaration to end
+        startLine,
+        endLine,
+        context
       });
     }
 
