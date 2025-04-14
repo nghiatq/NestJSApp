@@ -33,10 +33,12 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
 
   private sqlRegex: RegExp;
   private fileContent: string;
+  private logger: Logger;
 
-  constructor(fileContent: string) {
+  constructor(fileContent: string, logger: Logger) {
     super();
     this.fileContent = fileContent;
+    this.logger = logger;
     this.sqlRegex = new RegExp(
       `(${this.sqlKeywords.join('|')})`,
       'i'
@@ -47,64 +49,138 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
   // Helper method to determine the line range for SQL statements
   private determineLineRange(node: any, currentLine: number, _sqlValue: string): { startLine: number, endLine: number, context: string } {
     const lines = this.fileContent.split('\n');
-    let startLine = currentLine;
-    let endLine = currentLine;
 
     // 1. Check if this is a variable declaration
     if (node.type === 'VariableDeclaration') {
-      // For variable declarations, use the declaration line as the start
-      startLine = node.location?.startLine || currentLine;
-      endLine = node.location?.endLine || currentLine;
+      return this.determineVariableDeclarationRange(node, currentLine, lines);
     }
     // 2. Check if this is a string literal
     else if (node.tokenType?.name === 'StringLiteral') {
-      // For string literals, try to find the variable declaration
-      const currentLineText = lines[currentLine - 1] || '';
-
-      if (currentLineText.includes('String ') && currentLineText.includes('=')) {
-        // This is already a variable declaration line
-        startLine = currentLine;
-      } else {
-        // Look for the variable declaration in previous lines
-        for (let i = currentLine - 2; i >= 0; i--) {
-          const line = lines[i];
-          if (line.includes('String ') && line.includes('=')) {
-            startLine = i + 1; // 1-based line numbers
-            break;
-          }
-        }
-      }
-
-      endLine = node.endLine || currentLine;
+      return this.determineStringLiteralRange(node, currentLine, lines);
     }
     // 3. Check if this is a StringBuilder operation
     else if (node.type === 'MethodInvocation' && node.children?.identifier?.[0]?.image === 'append') {
-      // For StringBuilder operations, find the declaration line
-      let builderVarName = '';
+      return this.determineStringBuilderRange(node, currentLine, lines);
+    }
 
-      // Extract the variable name from the method call
-      if (node.children?.primary?.[0]?.children?.primaryPrefix?.[0]?.children?.primary?.[0]?.children?.identifier) {
-        builderVarName = node.children.primary[0].children.primaryPrefix[0].children.primary[0].children.identifier[0].image;
-      }
+    // Default case - use the current line
+    const startLine = currentLine;
+    const endLine = currentLine;
+    const context = lines.slice(
+      Math.max(0, startLine - 1),
+      Math.min(lines.length, endLine)
+    ).join('\n');
 
-      // Find the declaration line
-      for (let i = 0; i < lines.length; i++) {
+    return { startLine, endLine, context };
+  }
+
+  // Helper method to determine the line range for variable declarations
+  private determineVariableDeclarationRange(node: any, currentLine: number, lines: string[]): { startLine: number, endLine: number, context: string } {
+    // For variable declarations, use the declaration line as the start
+    const startLine = node.location?.startLine || currentLine;
+    const endLine = node.location?.endLine || currentLine;
+
+    // Get the full content from start to end line
+    const context = lines.slice(
+      Math.max(0, startLine - 1), // -1 to convert to 0-based index
+      Math.min(lines.length, endLine)
+    ).join('\n');
+
+    return { startLine, endLine, context };
+  }
+
+  // Helper method to determine the line range for string literals
+  private determineStringLiteralRange(node: any, currentLine: number, lines: string[]): { startLine: number, endLine: number, context: string } {
+    let startLine = currentLine;
+    const endLine = node.endLine || currentLine;
+
+    // For string literals, try to find the variable declaration
+    const currentLineText = lines[currentLine - 1] || '';
+
+    if (currentLineText.includes('String ') && currentLineText.includes('=')) {
+      // This is already a variable declaration line
+      startLine = currentLine;
+      this.logger.debug(`String literal: Found declaration on current line ${currentLine}: ${currentLineText}`);
+    } else {
+      // Look for the variable declaration in previous lines
+      for (let i = currentLine - 2; i >= 0; i--) {
         const line = lines[i];
-        if (line.includes('StringBuilder ' + builderVarName) ||
-            line.includes('StringBuilder ' + builderVarName + ' ')) {
+        if (line.includes('String ') && line.includes('=')) {
           startLine = i + 1; // 1-based line numbers
+          this.logger.debug(`String literal: Found declaration on line ${startLine}: ${line}`);
           break;
         }
       }
-
-      // If we couldn't find the declaration, use the current node's line
-      if (startLine === currentLine && node.location?.startLine) {
-        startLine = node.location.startLine;
-      }
-
-      // Use the current node's end line
-      endLine = node.location?.endLine || currentLine;
     }
+
+    this.logger.debug(`String literal range: ${startLine}-${endLine}`);
+
+    // Get the full content from start to end line
+    const context = lines.slice(
+      Math.max(0, startLine - 1), // -1 to convert to 0-based index
+      Math.min(lines.length, endLine)
+    ).join('\n');
+
+    return { startLine, endLine, context };
+  }
+
+  // Helper method to determine the line range for StringBuilder operations
+  private determineStringBuilderRange(node: any, currentLine: number, lines: string[]): { startLine: number, endLine: number, context: string } {
+    let startLine = currentLine;
+    let endLine = currentLine;
+
+    // For StringBuilder operations, find the declaration line
+    let builderVarName = '';
+
+    this.logger.debug(`StringBuilder: Analyzing node at line ${currentLine}`);
+    this.logger.debug(`StringBuilder: Node type: ${node.type}`);
+    this.logger.debug(`StringBuilder: Node location: ${JSON.stringify(node.location)}`);
+
+    // Extract the variable name from the method call
+    if (node.children?.primary?.[0]?.children?.primaryPrefix?.[0]?.children?.primary?.[0]?.children?.identifier) {
+      builderVarName = node.children.primary[0].children.primaryPrefix[0].children.primary[0].children.identifier[0].image;
+      this.logger.debug(`StringBuilder: Found variable name: ${builderVarName}`);
+    } else {
+      this.logger.debug(`StringBuilder: Could not extract variable name from node`);
+    }
+
+    // Find the declaration line
+    let declarationFound = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.includes('StringBuilder ' + builderVarName) ||
+          line.includes('StringBuilder ' + builderVarName + ' ')) {
+        startLine = i + 1; // 1-based line numbers
+        this.logger.debug(`StringBuilder: Found declaration on line ${startLine}: ${line}`);
+        declarationFound = true;
+        break;
+      }
+    }
+
+    if (!declarationFound) {
+      this.logger.debug(`StringBuilder: Declaration not found for variable ${builderVarName}`);
+
+      // Try a more general approach - look for any StringBuilder declaration before the current line
+      for (let i = Math.max(0, currentLine - 20); i < currentLine; i++) {
+        const line = lines[i];
+        if (line.includes('StringBuilder') && line.includes('new StringBuilder')) {
+          startLine = i + 1; // 1-based line numbers
+          this.logger.debug(`StringBuilder: Found potential declaration on line ${startLine}: ${line}`);
+          declarationFound = true;
+          break;
+        }
+      }
+    }
+
+    // If we couldn't find the declaration, use the current node's line
+    if (!declarationFound && node.location?.startLine) {
+      startLine = node.location.startLine;
+      this.logger.debug(`StringBuilder: Using node's start line: ${startLine}`);
+    }
+
+    // Use the current node's end line
+    endLine = node.location?.endLine || currentLine;
+    this.logger.debug(`StringBuilder range: ${startLine}-${endLine}`);
 
     // Get the full content from start to end line
     const context = lines.slice(
@@ -256,6 +332,8 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
         node.children.argumentList[0].children &&
         node.children.argumentList[0].children.expression) {
 
+      this.logger.debug(`Processing StringBuilder append at line ${node.location?.startLine || 'unknown'}`);
+
       const expression = node.children.argumentList[0].children.expression[0];
       if (expression.children && expression.children.primary &&
           expression.children.primary[0].children &&
@@ -266,17 +344,70 @@ class SqlStringVisitor extends BaseJavaCstVisitorWithDefaults {
         const stringLiteral = expression.children.primary[0].children.literal[0].children.StringLiteral[0];
         const value = stringLiteral.image.substring(1, stringLiteral.image.length - 1);
 
+        this.logger.debug(`StringBuilder append value: "${value}" at line ${stringLiteral.startLine || 'unknown'}`);
+
         // Check if the string contains SQL
         if (this.sqlRegex.test(value)) {
+          this.logger.debug(`SQL found in StringBuilder append: "${value}"`);
+
           // Get the current line from the string literal
           const currentLine = stringLiteral.startLine || (node.location?.startLine || 1);
 
-          // Determine the line range using our helper method
-          const { startLine, endLine, context } = this.determineLineRange(
-            node,
-            currentLine,
-            value
-          );
+          // Extract the variable name from the method call
+          let builderVarName = '';
+          if (node.children?.primary?.[0]?.children?.primaryPrefix?.[0]?.children?.primary?.[0]?.children?.identifier) {
+            builderVarName = node.children.primary[0].children.primaryPrefix[0].children.primary[0].children.identifier[0].image;
+            this.logger.debug(`StringBuilder variable name: ${builderVarName}`);
+          }
+
+          // Get the file content as lines
+          const lines = this.fileContent.split('\n');
+
+          // Find the declaration line
+          let startLine = currentLine;
+          let declarationFound = false;
+
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (line.includes('StringBuilder ' + builderVarName) ||
+                line.includes('StringBuilder ' + builderVarName + ' ')) {
+              startLine = i + 1; // 1-based line numbers
+              this.logger.debug(`StringBuilder: Found declaration on line ${startLine}: ${line}`);
+              declarationFound = true;
+              break;
+            }
+          }
+
+          if (!declarationFound) {
+            this.logger.debug(`StringBuilder: Declaration not found for variable ${builderVarName}`);
+
+            // Try a more general approach - look for any StringBuilder declaration before the current line
+            for (let i = Math.max(0, currentLine - 20); i < currentLine; i++) {
+              const line = lines[i];
+              if (line.includes('StringBuilder') && line.includes('new StringBuilder')) {
+                startLine = i + 1; // 1-based line numbers
+                this.logger.debug(`StringBuilder: Found potential declaration on line ${startLine}: ${line}`);
+                declarationFound = true;
+                break;
+              }
+            }
+          }
+
+          // If we still couldn't find the declaration, use the current line
+          if (!declarationFound) {
+            this.logger.debug(`StringBuilder: Using current line ${currentLine} as start line`);
+          }
+
+          // Use the current node's end line
+          const endLine = node.location?.endLine || currentLine;
+
+          // Get the full content from start to end line
+          const context = lines.slice(
+            Math.max(0, startLine - 1), // -1 to convert to 0-based index
+            Math.min(lines.length, endLine)
+          ).join('\n');
+
+          this.logger.debug(`StringBuilder SQL range: ${startLine}-${endLine}`);
 
           this.sqlStrings.push({
             value,
@@ -514,8 +645,22 @@ export class JavaAnalyzerService {
 
       // Check if paragraphs overlap or are adjacent
       if (nextParagraph.lineStart <= currentParagraph.lineEnd + 1) {
-        // Merge the paragraphs
-        currentParagraph = this.mergeParagraphs(currentParagraph, nextParagraph);
+        // Check if the paragraphs are of the same type (String or StringBuilder)
+        // by examining their content
+        const currentIsStringBuilder = this.isStringBuilderParagraph(currentParagraph.content);
+        const nextIsStringBuilder = this.isStringBuilderParagraph(nextParagraph.content);
+
+        // Only merge if they are the same type
+        if (currentIsStringBuilder === nextIsStringBuilder) {
+          // Merge the paragraphs
+          currentParagraph = this.mergeParagraphs(currentParagraph, nextParagraph);
+          this.logger.debug(`Merged paragraphs of type ${currentIsStringBuilder ? 'StringBuilder' : 'String'}: ${currentParagraph.lineStart}-${currentParagraph.lineEnd}`);
+        } else {
+          // Different types, don't merge
+          this.logger.debug(`Not merging different types: ${currentIsStringBuilder ? 'StringBuilder' : 'String'} (${currentParagraph.lineStart}-${currentParagraph.lineEnd}) and ${nextIsStringBuilder ? 'StringBuilder' : 'String'} (${nextParagraph.lineStart}-${nextParagraph.lineEnd})`);
+          mergedParagraphs.push(currentParagraph);
+          currentParagraph = nextParagraph;
+        }
       } else {
         // No overlap, add the current paragraph and move to the next one
         mergedParagraphs.push(currentParagraph);
@@ -603,6 +748,44 @@ export class JavaAnalyzerService {
     return hash.toString();
   }
 
+  // Helper method to determine if a paragraph is a StringBuilder operation
+  private isStringBuilderParagraph(content: string): boolean {
+    // Log the content for debugging
+    this.logger.debug(`Checking content type: ${content.substring(0, 50)}...`);
+
+    // First, check if this is a String operation (these take precedence)
+
+    // Check if this is a String declaration
+    if (content.includes('String ') && content.includes(' = ')) {
+      this.logger.debug(`Detected String declaration`);
+      return false;
+    }
+
+    // Check if this is a String concatenation (+=) operation
+    if (content.includes('String ') || content.includes(' += ')) {
+      this.logger.debug(`Detected String operation`);
+      return false;
+    }
+
+    // Now check for StringBuilder operations
+
+    // Check if the content contains StringBuilder declaration
+    if (content.includes('StringBuilder') && content.includes('new StringBuilder')) {
+      this.logger.debug(`Detected StringBuilder declaration`);
+      return true;
+    }
+
+    // Check if the content contains StringBuilder append method
+    if (content.includes('.append(')) {
+      this.logger.debug(`Detected StringBuilder append method`);
+      return true;
+    }
+
+    // Default to false (treat as String)
+    this.logger.debug(`Default to String type`);
+    return false;
+  }
+
   private async analyzeJavaFile(filePath: string): Promise<AnalysisResult> {
     // Read the file content
     const fileContent = fs.readFileSync(filePath, 'utf8');
@@ -614,7 +797,7 @@ export class JavaAnalyzerService {
       const ast = parse(fileContent);
 
       // Use our visitor to find SQL strings
-      const visitor = new SqlStringVisitor(fileContent);
+      const visitor = new SqlStringVisitor(fileContent, this.logger);
       visitor.visit(ast);
 
       // Convert the visitor's SQL strings to our SqlParagraph format
@@ -926,8 +1109,21 @@ export class JavaAnalyzerService {
 
         // Check if paragraphs overlap or are adjacent
         if (nextParagraph.lineStart <= currentParagraph.lineEnd + 1) {
-          // Merge the paragraphs
-          currentParagraph = this.mergeParagraphs(currentParagraph, nextParagraph);
+          // Check if the paragraphs are of the same type (String or StringBuilder)
+          // by examining their content
+          const currentIsStringBuilder = this.isStringBuilderParagraph(currentParagraph.content);
+          const nextIsStringBuilder = this.isStringBuilderParagraph(nextParagraph.content);
+
+          // Only merge if they are the same type
+          if (currentIsStringBuilder === nextIsStringBuilder) {
+            // Merge the paragraphs
+            currentParagraph = this.mergeParagraphs(currentParagraph, nextParagraph);
+          } else {
+            // Different types, don't merge
+            this.logger.debug(`Not merging different types: ${currentIsStringBuilder ? 'StringBuilder' : 'String'} and ${nextIsStringBuilder ? 'StringBuilder' : 'String'}`);
+            mergedParagraphs.push(currentParagraph);
+            currentParagraph = nextParagraph;
+          }
         } else {
           // No overlap, add the current paragraph and move to the next one
           mergedParagraphs.push(currentParagraph);
